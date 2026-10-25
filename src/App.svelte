@@ -1,14 +1,15 @@
 <script>
   import { onMount, tick } from 'svelte';
+  import { isSupabaseConfigured, supabase } from './lib/supabase.js';
 
   const storageKey = 'daylist-tasks-v1';
   const noteColors = ['yellow', 'mint', 'rose', 'peach', 'sky', 'lilac'];
   const workspaceThemes = [
-    { id: 'sage', name: 'Sage', preview: '#78967b' },
-    { id: 'ocean', name: 'Ocean', preview: '#6489ad' },
-    { id: 'lavender', name: 'Lavender', preview: '#8a78ad' },
-    { id: 'coral', name: 'Coral', preview: '#c77c6d' },
-    { id: 'amber', name: 'Amber', preview: '#b08a46' },
+    { id: 'lagoon', name: 'Lagoon', preview: '#00a896' },
+    { id: 'cobalt', name: 'Cobalt', preview: '#4568e8' },
+    { id: 'plum', name: 'Plum', preview: '#a24bd6' },
+    { id: 'tangerine', name: 'Tangerine', preview: '#f07842' },
+    { id: 'lime', name: 'Lime', preview: '#77a82a' },
   ];
   const themeStorageKey = 'daylist-workspace-theme-v1';
   const weekdays = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
@@ -17,7 +18,7 @@
   let tasks = $state([]);
   let filter = $state('wall');
   let searchQuery = $state('');
-  let theme = $state('sage');
+  let theme = $state('lagoon');
   let themePickerOpen = $state(false);
   let modalOpen = $state(false);
   let modalTitle = $state('');
@@ -37,12 +38,69 @@
   let reminderPermission = $state('unsupported');
   let reminderQueue = $state([]);
   let currentTime = $state(Date.now());
+  let syncStatus = $state('connecting');
+  let syncMessage = $state('');
+  let activeUserId = null;
+
+  function taskFromRow(row) {
+    return {
+      id: row.id,
+      title: row.title,
+      done: Boolean(row.done),
+      createdAt: new Date(row.created_at).getTime() || Date.now(),
+      dueAt: row.due_at ? new Date(row.due_at).toISOString() : '',
+      reminded: Boolean(row.reminded),
+      notes: typeof row.notes === 'string' ? row.notes : '',
+      color: noteColors.includes(row.color) ? row.color : '',
+    };
+  }
+
+  function taskToRow(task) {
+    return {
+      id: task.id,
+      user_id: activeUserId,
+      title: task.title,
+      done: task.done,
+      created_at: new Date(task.createdAt).toISOString(),
+      due_at: task.dueAt || null,
+      reminded: task.reminded,
+      notes: task.notes || '',
+      color: noteColors.includes(task.color) ? task.color : 'yellow',
+      updated_at: new Date().toISOString(),
+    };
+  }
+
+  async function syncTask(task) {
+    if (!isSupabaseConfigured || !activeUserId) return;
+    syncStatus = 'syncing';
+    const { error } = await supabase.from('tasks').upsert(taskToRow(task));
+    if (error) {
+      syncStatus = 'offline';
+      syncMessage = error.message;
+    } else {
+      syncStatus = 'connected';
+      syncMessage = '';
+    }
+  }
+
+  async function removeRemoteTask(id) {
+    if (!isSupabaseConfigured || !activeUserId) return;
+    const { error } = await supabase.from('tasks').delete().eq('id', id);
+    if (error) {
+      syncStatus = 'offline';
+      syncMessage = error.message;
+    } else {
+      syncStatus = 'connected';
+      syncMessage = '';
+    }
+  }
 
   onMount(() => {
+    let cachedTasks = [];
     try {
       const saved = JSON.parse(localStorage.getItem(storageKey) || '[]');
       if (Array.isArray(saved)) {
-        tasks = saved.filter((task) => task && typeof task.id === 'string' && typeof task.title === 'string')
+        cachedTasks = saved.filter((task) => task && typeof task.id === 'string' && typeof task.title === 'string')
           .map((task) => ({
             id: task.id,
             title: task.title,
@@ -53,6 +111,7 @@
             notes: typeof task.notes === 'string' ? task.notes : '',
             color: noteColors.includes(task.color) ? task.color : '',
           }));
+        tasks = cachedTasks;
       }
     } catch {
       tasks = [];
@@ -62,8 +121,45 @@
       if (workspaceThemes.some((option) => option.id === savedTheme)) theme = savedTheme;
     } catch { /* Theme preferences may be unavailable in private browsing. */ }
     if ('Notification' in window) reminderPermission = Notification.permission;
-    ready = true;
-    checkReminders();
+    const connectAndLoad = async () => {
+      if (!isSupabaseConfigured) {
+        syncStatus = 'local';
+        syncMessage = 'Add the Supabase settings to .env.local to enable cloud sync.';
+        ready = true;
+        checkReminders();
+        return;
+      }
+
+      try {
+        let { data: { session }, error } = await supabase.auth.getSession();
+        if (error) throw error;
+        if (!session) {
+          const result = await supabase.auth.signInAnonymously();
+          if (result.error) throw result.error;
+          session = result.data.session;
+        }
+        activeUserId = session.user.id;
+
+        const { data: rows, error: loadError } = await supabase.from('tasks').select('*').order('created_at', { ascending: false });
+        if (loadError) throw loadError;
+
+        if (rows.length) {
+          tasks = rows.map(taskFromRow);
+        } else if (cachedTasks.length) {
+          const { error: migrationError } = await supabase.from('tasks').upsert(cachedTasks.map(taskToRow));
+          if (migrationError) throw migrationError;
+          tasks = cachedTasks;
+        }
+        syncStatus = 'connected';
+        syncMessage = '';
+      } catch (error) {
+        syncStatus = 'offline';
+        syncMessage = error?.message || 'Could not connect to Supabase.';
+      }
+      ready = true;
+      checkReminders();
+    };
+    void connectAndLoad();
     const timer = window.setInterval(() => {
       currentTime = Date.now();
       checkReminders();
@@ -107,11 +203,15 @@
     const title = modalTitle.trim();
     if (!title) return;
     if (editingTaskId) {
-      tasks = tasks.map((task) => task.id === editingTaskId
-        ? { ...task, title, notes: modalNotes, dueAt: modalDue, color: modalColor, reminded: task.dueAt === modalDue ? task.reminded : false }
-        : task);
+      const updatedTask = tasks.find((task) => task.id === editingTaskId);
+      if (!updatedTask) return;
+      const nextTask = { ...updatedTask, title, notes: modalNotes, dueAt: modalDue, color: modalColor, reminded: updatedTask.dueAt === modalDue ? updatedTask.reminded : false };
+      tasks = tasks.map((task) => task.id === editingTaskId ? nextTask : task);
+      void syncTask(nextTask);
     } else {
-      tasks = [{ id: crypto.randomUUID(), title, done: false, createdAt: Date.now(), dueAt: modalDue, reminded: false, notes: modalNotes, color: modalColor }, ...tasks];
+      const newTask = { id: crypto.randomUUID(), title, done: false, createdAt: Date.now(), dueAt: modalDue, reminded: false, notes: modalNotes, color: modalColor };
+      tasks = [newTask, ...tasks];
+      void syncTask(newTask);
     }
     filter = 'wall';
     closeEditor();
@@ -244,11 +344,16 @@
   }
 
   function toggleTask(id) {
-    tasks = tasks.map((task) => task.id === id ? { ...task, done: !task.done } : task);
+    const updatedTask = tasks.find((task) => task.id === id);
+    if (!updatedTask) return;
+    const nextTask = { ...updatedTask, done: !updatedTask.done };
+    tasks = tasks.map((task) => task.id === id ? nextTask : task);
+    void syncTask(nextTask);
   }
 
   function deleteTask(id) {
     tasks = tasks.filter((task) => task.id !== id);
+    void removeRemoteTask(id);
     reminderQueue = reminderQueue.filter((task) => task.id !== id);
     if (editingTaskId === id) closeEditor();
   }
@@ -269,6 +374,8 @@
     if (!current) return;
     const snoozedUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
     tasks = tasks.map((task) => task.id === current.id ? { ...task, dueAt: snoozedUntil, reminded: false } : task);
+    const updatedTask = tasks.find((task) => task.id === current.id);
+    if (updatedTask) void syncTask(updatedTask);
     dismissReminder();
   }
 
@@ -289,6 +396,7 @@
     if (!dueNow.length) return;
     const ids = new Set(dueNow.map((task) => task.id));
     tasks = tasks.map((task) => ids.has(task.id) ? { ...task, reminded: true } : task);
+    for (const task of tasks.filter((item) => ids.has(item.id))) void syncTask(task);
     reminderQueue = [...reminderQueue, ...dueNow];
     if (reminderPermission === 'granted' && 'Notification' in window) {
       dueNow.forEach((task) => {
@@ -305,7 +413,7 @@
 </script>
 
 <svelte:head>
-  <title>Daylist — a little more focused</title>
+  <title>Louie To do List</title>
 </svelte:head>
 
 <svelte:window onkeydown={handleWindowKeydown} />
@@ -313,9 +421,9 @@
 <div class="page-backdrop theme-{theme}">
   <div class="app-shell">
     <aside class="sidebar">
-      <a class="brand" href="#home" aria-label="Daylist home">
+      <a class="brand" href="#home" aria-label="Louie To do List home">
         <span class="brand-mark"><span></span><span></span><span></span></span>
-        <span>daylist<span class="brand-period">.</span></span>
+        <span>Louie<span class="brand-period">.</span><small>TO DO LIST</small></span>
       </a>
 
       <div class="menu-heading"><span>MENU</span><span class="menu-mark">☰</span></div>
@@ -371,6 +479,10 @@
       <header class="topbar">
         <div class="breadcrumb">MY SPACE <span>/</span> <strong>{filter === 'wall' ? 'TO-DO LIST' : filter === 'today' ? 'TODAY' : filter === 'upcoming' ? 'UPCOMING' : filter === 'missed' ? 'MISSED' : 'COMPLETED'}</strong></div>
         <div class="top-actions">
+          <span class="cloud-status {syncStatus}" title={syncMessage || 'Task storage status'}>
+            <span class="cloud-status-dot"></span>
+            {syncStatus === 'connected' ? 'Synced' : syncStatus === 'syncing' || syncStatus === 'connecting' ? 'Syncing' : syncStatus === 'local' ? 'Local only' : 'Offline'}
+          </span>
           {#if reminderPermission === 'granted'}
             <span class="reminder-status enabled" title="Browser reminders are enabled">◉ <span>Reminders on</span></span>
           {:else if reminderPermission === 'denied'}
@@ -430,7 +542,7 @@
   {#if modalOpen}
     <div class="modal-backdrop">
       <dialog bind:this={paperDialog} class="paper-sheet paper-{modalColor}" aria-labelledby="paper-title" oncancel={(event) => { event.preventDefault(); closeEditor(); }}>
-        <div class="paper-header"><span class="paper-kicker">DAYLIST <span>·</span> YOUR TASKS</span><button type="button" class="paper-close" aria-label="Close editor" onclick={closeEditor}>×</button></div>
+        <div class="paper-header"><span class="paper-kicker">LOUIE <span>·</span> YOUR TASKS</span><button type="button" class="paper-close" aria-label="Close editor" onclick={closeEditor}>×</button></div>
         <h2 id="paper-title">{editingTaskId ? 'Edit your task' : 'A new task'}</h2>
         <form class="paper-form" onsubmit={saveNote}>
           <label class="paper-label" for="paper-task-title">WHAT DO YOU NEED TO DO?</label>
@@ -493,7 +605,7 @@
     <div class="due-reminder-overlay">
       <dialog open class="due-reminder-card" aria-modal="true" aria-labelledby="due-reminder-title" aria-describedby="due-reminder-details">
         <div class="reminder-card-top">
-          <span class="reminder-brand"><span class="reminder-brand-mark">d.</span> DAYLIST REMINDER</span>
+          <span class="reminder-brand"><span class="reminder-brand-mark">L.</span> LOUIE REMINDER</span>
           <button class="reminder-close" type="button" aria-label="Dismiss reminder" onclick={dismissReminder}>×</button>
         </div>
         <div class="reminder-clock-mark" aria-hidden="true"><span>◷</span></div>
